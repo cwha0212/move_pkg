@@ -577,18 +577,10 @@ class Nav2RosController(Node):
             "start": {
                 "lat": start_lat,
                 "lon": start_lon,
-                "lat_str": ""
-                if start_lat is None
-                else format_float_full_precision(start_lat),
-                "lon_str": ""
-                if start_lon is None
-                else format_float_full_precision(start_lon),
             },
             "goal": {
                 "lat": goal_lat,
                 "lon": goal_lon,
-                "lat_str": format_float_full_precision(goal_lat),
-                "lon_str": format_float_full_precision(goal_lon),
             },
             "timestamp_unix": time.time(),
         }
