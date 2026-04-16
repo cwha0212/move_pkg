@@ -188,9 +188,25 @@ class Nav2RosController(Node):
         goal_lon = float(msg.longitude)
         if not math.isfinite(goal_lat) or not math.isfinite(goal_lon):
             self.get_logger().error("ROS goal 수신값 오류: latitude/longitude가 유한값이 아닙니다.")
+            self._publish_goal_received_ack(
+                goal_lat=goal_lat,
+                goal_lon=goal_lon,
+                status="goal_rejected",
+                reason="INVALID_GOAL_LATLON",
+                message="목표 좌표가 유효하지 않습니다. latitude/longitude 값을 확인해주세요.",
+            )
             self._publish_move_status(False)
             return
-        self._resolve_mission_anchor()
+        if not self._resolve_mission_anchor():
+            self._publish_goal_received_ack(
+                goal_lat=goal_lat,
+                goal_lon=goal_lon,
+                status="goal_rejected",
+                reason="MISSION_ANCHOR_UNAVAILABLE",
+                message="현재 위치를 확인할 수 없어 목표를 처리할 수 없습니다. LIGO 위치 수신 후 다시 시도해주세요.",
+            )
+            self._publish_move_status(False)
+            return
         self._publish_goal_received_ack(goal_lat=goal_lat, goal_lon=goal_lon)
         self._handle_goal(goal_lat=goal_lat, goal_lon=goal_lon)
 
@@ -212,19 +228,23 @@ class Nav2RosController(Node):
         self._latest_ligo_heading_stamp_sec = self.get_clock().now().nanoseconds / 1e9
         self._publish_current_heading(self._latest_ligo_heading_deg)
 
-    def _update_start_pose_from_ligo_if_enabled(self) -> None:
+    def _update_start_pose_from_ligo_if_enabled(self) -> bool:
         if not bool(self.get_parameter("ligo.use_current_as_start_on_mission").value):
-            return
+            return True
         if self._latest_ligo_lat is None or self._latest_ligo_lon is None:
-            self.get_logger().warn("LIGO 현재 위치 미수신: 기존 start_pose를 사용합니다.")
-            return
+            self.get_logger().error(
+                "LIGO 현재 위치 미수신: 목표를 처리할 수 없습니다. LIGO 위치 수신 후 다시 시도해주세요."
+            )
+            return False
         now_sec = self.get_clock().now().nanoseconds / 1e9
         max_age_sec = float(self.get_parameter("ligo.max_data_age_sec").value)
         if self._latest_ligo_position_stamp_sec is None or (
             now_sec - self._latest_ligo_position_stamp_sec > max_age_sec
         ):
-            self.get_logger().warn("LIGO 위치 데이터가 오래됨: 기존 start_pose를 사용합니다.")
-            return
+            self.get_logger().error(
+                "LIGO 위치 데이터가 오래되었습니다: 목표를 처리할 수 없습니다. 최신 위치 수신 후 다시 시도해주세요."
+            )
+            return False
         heading_deg = self.heading_deg
         if self._latest_ligo_heading_deg is not None and self._latest_ligo_heading_stamp_sec is not None:
             heading_is_fresh = now_sec - self._latest_ligo_heading_stamp_sec <= max_age_sec
@@ -250,18 +270,20 @@ class Nav2RosController(Node):
             f"lon={format_float_full_precision(self.origin_lon)}, "
             f"heading={self.heading_deg:.2f}"
         )
+        return True
 
-    def _resolve_mission_anchor(self) -> None:
+    def _resolve_mission_anchor(self) -> bool:
         anchor_on_goal = bool(self.get_parameter("ligo.anchor_on_goal").value)
         reanchor_each_goal = bool(self.get_parameter("ligo.reanchor_each_goal").value)
         if not anchor_on_goal:
-            self._update_start_pose_from_ligo_if_enabled()
+            if not self._update_start_pose_from_ligo_if_enabled():
+                return False
             self._mission_anchor_lat = self.origin_lat
             self._mission_anchor_lon = self.origin_lon
             self._mission_anchor_heading_deg = self.heading_deg
             self._reset_mission_enu_origin()
             self._record_anchor_history(self._mission_anchor_lat, self._mission_anchor_lon)
-            return
+            return True
 
         need_new_anchor = (
             self._mission_anchor_lat is None
@@ -270,7 +292,8 @@ class Nav2RosController(Node):
             or reanchor_each_goal
         )
         if need_new_anchor:
-            self._update_start_pose_from_ligo_if_enabled()
+            if not self._update_start_pose_from_ligo_if_enabled():
+                return False
             self._mission_anchor_lat = self.origin_lat
             self._mission_anchor_lon = self.origin_lon
             self._mission_anchor_heading_deg = self.heading_deg
@@ -286,6 +309,7 @@ class Nav2RosController(Node):
             self.origin_lat = float(self._mission_anchor_lat)
             self.origin_lon = float(self._mission_anchor_lon)
             self.heading_deg = float(self._mission_anchor_heading_deg)
+        return True
 
     def _handle_goal(self, goal_lat: float, goal_lon: float) -> None:
         if not self.nav_client.wait_for_server(
@@ -535,19 +559,28 @@ class Nav2RosController(Node):
         msg.data = bool(success)
         self.move_status_pub.publish(msg)
 
-    def _publish_goal_received_ack(self, goal_lat: float, goal_lon: float) -> None:
+    def _publish_goal_received_ack(
+        self,
+        goal_lat: float,
+        goal_lon: float,
+        status: str = "goal_received",
+        reason: str = "",
+        message: str = "",
+    ) -> None:
+        payload = {
+            "status": status,
+            "lat": goal_lat,
+            "lon": goal_lon,
+            "lat_str": format_float_full_precision(goal_lat),
+            "lon_str": format_float_full_precision(goal_lon),
+            "timestamp_unix": time.time(),
+        }
+        if reason:
+            payload["reason"] = reason
+        if message:
+            payload["message"] = message
         msg = String()
-        msg.data = json.dumps(
-            {
-                "status": "goal_received",
-                "lat": goal_lat,
-                "lon": goal_lon,
-                "lat_str": format_float_full_precision(goal_lat),
-                "lon_str": format_float_full_precision(goal_lon),
-                "timestamp_unix": time.time(),
-            },
-            ensure_ascii=True,
-        )
+        msg.data = json.dumps(payload, ensure_ascii=True)
         self.goal_received_pub.publish(msg)
 
     def _publish_current_heading(self, heading_deg: float) -> None:
