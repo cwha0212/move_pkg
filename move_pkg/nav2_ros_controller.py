@@ -423,7 +423,7 @@ class Nav2RosController(Node):
                 goal_lon=goal_lon,
             )
             reached_msg = String()
-            reached_msg.data = json.dumps(payload, ensure_ascii=True)
+            reached_msg.data = json.dumps(payload, ensure_ascii=False)
             self.reached_pub.publish(reached_msg)
         else:
             self.get_logger().warn(f"goal 종료 상태 코드: {status}")
@@ -614,7 +614,7 @@ class Nav2RosController(Node):
             goal_lon=goal_lon,
         )
         msg = String()
-        msg.data = json.dumps(payload, ensure_ascii=True)
+        msg.data = json.dumps(payload, ensure_ascii=False)
         self.goal_received_pub.publish(msg)
 
     def _publish_current_heading(self, heading_deg: float) -> None:
