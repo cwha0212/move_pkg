@@ -191,9 +191,8 @@ class Nav2RosController(Node):
             self._publish_goal_received_ack(
                 goal_lat=goal_lat,
                 goal_lon=goal_lon,
-                status="goal_rejected",
-                reason="INVALID_GOAL_LATLON",
-                message="목표 좌표가 유효하지 않습니다. latitude/longitude 값을 확인해주세요.",
+                command_failed=True,
+                reason="목표 좌표가 유효하지 않습니다. latitude/longitude 값을 확인해주세요.",
             )
             self._publish_move_status(False)
             return
@@ -201,13 +200,17 @@ class Nav2RosController(Node):
             self._publish_goal_received_ack(
                 goal_lat=goal_lat,
                 goal_lon=goal_lon,
-                status="goal_rejected",
-                reason="MISSION_ANCHOR_UNAVAILABLE",
-                message="현재 위치를 확인할 수 없어 목표를 처리할 수 없습니다. LIGO 위치 수신 후 다시 시도해주세요.",
+                command_failed=True,
+                reason="현재 위치를 확인할 수 없어 목표를 처리할 수 없습니다. LIGO 위치 수신 후 다시 시도해주세요.",
             )
             self._publish_move_status(False)
             return
-        self._publish_goal_received_ack(goal_lat=goal_lat, goal_lon=goal_lon)
+        self._publish_goal_received_ack(
+            goal_lat=goal_lat,
+            goal_lon=goal_lon,
+            command_failed=False,
+            reason="목표 명령이 정상 접수되었습니다.",
+        )
         self._handle_goal(goal_lat=goal_lat, goal_lon=goal_lon)
 
     def _on_ligo_global_position(self, msg: NavSatFix) -> None:
@@ -411,14 +414,14 @@ class Nav2RosController(Node):
         if status == 4:
             self.get_logger().info("목표 도달 완료")
             self._publish_move_status(True)
-            payload = {
-                "status": "reached",
-                "lat": goal_lat,
-                "lon": goal_lon,
-                "lat_str": format_float_full_precision(goal_lat),
-                "lon_str": format_float_full_precision(goal_lon),
-                "timestamp_unix": time.time(),
-            }
+            payload = self._build_command_status_payload(
+                command_failed=False,
+                reason="목표 지점에 도달했습니다.",
+                start_lat=self.origin_lat,
+                start_lon=self.origin_lon,
+                goal_lat=goal_lat,
+                goal_lon=goal_lon,
+            )
             reached_msg = String()
             reached_msg.data = json.dumps(payload, ensure_ascii=True)
             self.reached_pub.publish(reached_msg)
@@ -559,26 +562,57 @@ class Nav2RosController(Node):
         msg.data = bool(success)
         self.move_status_pub.publish(msg)
 
+    def _build_command_status_payload(
+        self,
+        command_failed: bool,
+        reason: str,
+        start_lat: float | None,
+        start_lon: float | None,
+        goal_lat: float,
+        goal_lon: float,
+    ) -> dict:
+        return {
+            "command_failed": bool(command_failed),
+            "reason": str(reason),
+            "start": {
+                "lat": start_lat,
+                "lon": start_lon,
+                "lat_str": ""
+                if start_lat is None
+                else format_float_full_precision(start_lat),
+                "lon_str": ""
+                if start_lon is None
+                else format_float_full_precision(start_lon),
+            },
+            "goal": {
+                "lat": goal_lat,
+                "lon": goal_lon,
+                "lat_str": format_float_full_precision(goal_lat),
+                "lon_str": format_float_full_precision(goal_lon),
+            },
+            "timestamp_unix": time.time(),
+        }
+
     def _publish_goal_received_ack(
         self,
         goal_lat: float,
         goal_lon: float,
-        status: str = "goal_received",
+        command_failed: bool = False,
         reason: str = "",
-        message: str = "",
     ) -> None:
-        payload = {
-            "status": status,
-            "lat": goal_lat,
-            "lon": goal_lon,
-            "lat_str": format_float_full_precision(goal_lat),
-            "lon_str": format_float_full_precision(goal_lon),
-            "timestamp_unix": time.time(),
-        }
-        if reason:
-            payload["reason"] = reason
-        if message:
-            payload["message"] = message
+        start_lat = None
+        start_lon = None
+        if self._mission_anchor_lat is not None and self._mission_anchor_lon is not None:
+            start_lat = float(self._mission_anchor_lat)
+            start_lon = float(self._mission_anchor_lon)
+        payload = self._build_command_status_payload(
+            command_failed=command_failed,
+            reason=reason,
+            start_lat=start_lat,
+            start_lon=start_lon,
+            goal_lat=goal_lat,
+            goal_lon=goal_lon,
+        )
         msg = String()
         msg.data = json.dumps(payload, ensure_ascii=True)
         self.goal_received_pub.publish(msg)
