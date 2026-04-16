@@ -1,0 +1,6 @@
+image: free_space_400m.pgm
+resolution: 20.0
+origin: [-200.0, -200.0, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196

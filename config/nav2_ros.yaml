@@ -1,0 +1,62 @@
+nav2_ros_controller:
+  ros__parameters:
+    map:
+      extent_m: 400.0
+      resolution_m_per_cell: 0.1
+    start_pose:
+      lat: 37.4123116410167
+      lon: 127.09331423461174
+      heading_deg_from_north_cw: 238.33736302749944
+    frames:
+      path_frame: "map"
+      mission_enu_frame: "mission_enu"
+      base_frame: "base_link"
+    topics:
+      goal_latlon_sub: "/move_pkg/nav/goal"
+      goal_received_pub: "/move_pkg/nav/goal_received"
+      reached_pub: "/move_pkg/nav/reached"
+      ligo_global_position_sub: "/ligo/global_position"
+      ligo_heading_deg_sub: "/ligo/enu_heading_deg"
+      current_heading_pub: "/move_pkg/nav/current_heading"
+      current_enu_pub: "/move_pkg/nav/current_enu"
+    ligo:
+      use_current_as_start_on_mission: true
+      anchor_on_goal: true
+      reanchor_each_goal: true
+      max_data_age_sec: 2.0
+      sync_tolerance_sec: 0.2
+    nav:
+      server_wait_timeout_sec: 15.0
+      frames:
+        global_frame: "map"
+        odom_frame: "camera_init"
+        robot_base_frame: "aft_mapped"
+      controller_frequency_hz: 10.0
+      use_rotation_shim: true
+      rotation_shim:
+        angular_dist_threshold_rad: 0.785
+        forward_sampling_distance_m: 0.5
+        rotate_to_heading_angular_vel: 1.2
+        max_angular_accel: 3.2
+        simulate_ahead_time_sec: 1.0
+        rotate_to_goal_heading: true
+
+virtual_robot_from_cmdvel:
+  ros__parameters:
+    frames:
+      path_frame: "map"
+      odom_frame: "odom"
+      base_frame: "base_link"
+    topics:
+      cmd_vel: "/cmd_vel_nav"
+      robot_marker: "/move_pkg/sim_robot_marker"
+      path: "/move_pkg/sim_path"
+      odom: "/odom"
+      scan: "/scan"
+    sim:
+      update_hz: 20.0
+      max_path_points: 2000
+      initial_heading_deg_from_north_cw: 238.33736302749944
+      publish_fake_scan: true
+      fake_scan_hz: 10.0
+      fake_scan_range_max: 30.0
