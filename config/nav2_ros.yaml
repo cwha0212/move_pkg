@@ -12,7 +12,7 @@ nav2_ros_controller:
       mission_enu_frame: "mission_enu"
       base_frame: "base_link"
     topics:
-      goal_latlon_sub: "/move_pkg/nav/goal"
+      goal_with_heading_sub: "/move_pkg/nav/goal_with_heading"
       goal_received_pub: "/move_pkg/nav/goal_received"
       reached_pub: "/move_pkg/nav/reached"
       ligo_global_position_sub: "/ligo/global_position"

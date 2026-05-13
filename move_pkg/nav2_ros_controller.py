@@ -1,17 +1,18 @@
-import json
+#!/usr/bin/env python3
+
 import math
 import threading
-import time
 from typing import Tuple
 
 import rclpy
 from geometry_msgs.msg import Point, PointStamped, PoseStamped
+from move_pkg.msg import GoalWithHeading
 from nav_msgs.msg import OccupancyGrid
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import NavSatFix
-from std_msgs.msg import Bool, Float64, String
+from std_msgs.msg import Bool, Float64
 from tf2_ros import Buffer, TransformListener
 from visualization_msgs.msg import Marker
 
@@ -65,7 +66,7 @@ class Nav2RosController(Node):
                 ("ligo.max_data_age_sec", 2.0),
                 ("ligo.sync_tolerance_sec", 0.2),
                 ("topics.move_status", "/move_status"),
-                ("topics.goal_latlon_sub", "/move_pkg/nav/goal"),
+                ("topics.goal_with_heading_sub", "/move_pkg/nav/goal_with_heading"),
                 ("topics.goal_received_pub", "/move_pkg/nav/goal_received"),
                 ("topics.reached_pub", "/move_pkg/nav/reached"),
                 ("topics.ligo_global_position_sub", "/ligo/global_position"),
@@ -82,7 +83,7 @@ class Nav2RosController(Node):
         self.path_frame = str(self.get_parameter("frames.path_frame").value)
         self.origin_marker_topic = "/move_pkg/enu_origin_marker"
         self.goal_latlon_sub_topic = str(
-            self.get_parameter("topics.goal_latlon_sub").value
+            self.get_parameter("topics.goal_with_heading_sub").value
         )
         self.goal_received_pub_topic = str(
             self.get_parameter("topics.goal_received_pub").value
@@ -123,6 +124,8 @@ class Nav2RosController(Node):
         self._anchor_history_points = []
         self._anchor_history_reference_lat = None
         self._anchor_history_reference_lon = None
+        self._active_goal_phase = ""
+        self._active_goal_heading_deg = None
 
         self.nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
         self.tf_buffer = Buffer()
@@ -133,9 +136,9 @@ class Nav2RosController(Node):
         move_status_topic = str(self.get_parameter("topics.move_status").value)
         self.move_status_pub = self.create_publisher(Bool, move_status_topic, 10)
         self.goal_received_pub = self.create_publisher(
-            String, self.goal_received_pub_topic, 10
+            GoalWithHeading, self.goal_received_pub_topic, 10
         )
-        self.reached_pub = self.create_publisher(String, self.reached_pub_topic, 10)
+        self.reached_pub = self.create_publisher(GoalWithHeading, self.reached_pub_topic, 10)
         self.current_heading_pub = self.create_publisher(
             Float64, self.current_heading_pub_topic, 10
         )
@@ -144,7 +147,7 @@ class Nav2RosController(Node):
         )
         self.create_subscription(OccupancyGrid, "/map", self._on_map, 10)
         self.create_subscription(
-            NavSatFix, self.goal_latlon_sub_topic, self._on_goal_navsat, 10
+            GoalWithHeading, self.goal_latlon_sub_topic, self._on_goal_with_heading, 10
         )
         self.create_subscription(
             NavSatFix, self.ligo_global_position_sub_topic, self._on_ligo_global_position, 10
@@ -165,10 +168,13 @@ class Nav2RosController(Node):
             f"heading={self.heading_deg:.2f} deg"
         )
         self.get_logger().info(
-            f"목표 ROS 토픽 구독: {self.goal_latlon_sub_topic} (sensor_msgs/NavSatFix)"
+            f"목표 ROS 토픽 구독: {self.goal_latlon_sub_topic} (move_pkg/GoalWithHeading)"
         )
         self.get_logger().info(
-            f"목표 수신 ACK 토픽 발행: {self.goal_received_pub_topic} (std_msgs/String)"
+            f"목표 수신 ACK 토픽 발행: {self.goal_received_pub_topic} (move_pkg/GoalWithHeading)"
+        )
+        self.get_logger().info(
+            f"목표 도달 토픽 발행: {self.reached_pub_topic} (move_pkg/GoalWithHeading)"
         )
         self.get_logger().info(
             f"LIGO 위치 토픽 구독: {self.ligo_global_position_sub_topic} (sensor_msgs/NavSatFix)"
@@ -183,35 +189,30 @@ class Nav2RosController(Node):
             f"anchor 기준 현재 ENU 토픽 발행: {self.current_enu_pub_topic} (geometry_msgs/PointStamped)"
         )
 
-    def _on_goal_navsat(self, msg: NavSatFix) -> None:
+    def _on_goal_with_heading(self, msg: GoalWithHeading) -> None:
         goal_lat = float(msg.latitude)
         goal_lon = float(msg.longitude)
+        goal_heading_deg = float(msg.heading_deg_from_north_cw) % 360.0
         if not math.isfinite(goal_lat) or not math.isfinite(goal_lon):
             self.get_logger().error("ROS goal 수신값 오류: latitude/longitude가 유한값이 아닙니다.")
-            self._publish_goal_received_ack(
-                goal_lat=goal_lat,
-                goal_lon=goal_lon,
-                command_failed=True,
-                reason="목표 좌표가 유효하지 않습니다. latitude/longitude 값을 확인해주세요.",
-            )
+            self._publish_goal_received_ack(goal_lat, goal_lon, goal_heading_deg)
+            self._publish_move_status(False)
+            return
+        if not math.isfinite(goal_heading_deg):
+            self.get_logger().error("ROS goal 수신값 오류: heading이 유한값이 아닙니다.")
+            self._publish_goal_received_ack(goal_lat, goal_lon, goal_heading_deg)
             self._publish_move_status(False)
             return
         if not self._resolve_mission_anchor():
-            self._publish_goal_received_ack(
-                goal_lat=goal_lat,
-                goal_lon=goal_lon,
-                command_failed=True,
-                reason="현재 위치를 확인할 수 없어 목표를 처리할 수 없습니다. LIGO 위치 수신 후 다시 시도해주세요.",
-            )
+            self._publish_goal_received_ack(goal_lat, goal_lon, goal_heading_deg)
             self._publish_move_status(False)
             return
-        self._publish_goal_received_ack(
+        self._publish_goal_received_ack(goal_lat, goal_lon, goal_heading_deg)
+        self._handle_goal(
             goal_lat=goal_lat,
             goal_lon=goal_lon,
-            command_failed=False,
-            reason="목표 명령이 정상 접수되었습니다.",
+            final_heading_deg=goal_heading_deg,
         )
-        self._handle_goal(goal_lat=goal_lat, goal_lon=goal_lon)
 
     def _on_ligo_global_position(self, msg: NavSatFix) -> None:
         lat = float(msg.latitude)
@@ -314,7 +315,9 @@ class Nav2RosController(Node):
             self.heading_deg = float(self._mission_anchor_heading_deg)
         return True
 
-    def _handle_goal(self, goal_lat: float, goal_lon: float) -> None:
+    def _handle_goal(
+        self, goal_lat: float, goal_lon: float, final_heading_deg: float | None = None
+    ) -> None:
         if not self.nav_client.wait_for_server(
             timeout_sec=float(self.get_parameter("nav.server_wait_timeout_sec").value)
         ):
@@ -326,13 +329,12 @@ class Nav2RosController(Node):
             goal_lat, goal_lon, self.origin_lat, self.origin_lon
         )
         goal_bearing_yaw = math.atan2(north, east)
-        planned_goal_yaw = goal_bearing_yaw
         if self._map_meta is not None:
             mx0 = self._map_meta["origin_x"]
             my0 = self._map_meta["origin_y"]
             mx1 = mx0 + self._map_meta["width"] * self._map_meta["resolution"]
             my1 = my0 + self._map_meta["height"] * self._map_meta["resolution"]
-        yaw = planned_goal_yaw
+        yaw = goal_bearing_yaw
         qx, qy, qz, qw = quaternion_from_yaw(yaw)
 
         goal_msg = NavigateToPose.Goal()
@@ -356,10 +358,18 @@ class Nav2RosController(Node):
 
         self._goal_request_seq += 1
         goal_request_id = self._goal_request_seq
+        self._active_goal_phase = "position"
+        self._active_goal_heading_deg = (
+            float(final_heading_deg) if final_heading_deg is not None else None
+        )
         send_future = self.nav_client.send_goal_async(goal_msg)
         send_future.add_done_callback(
             lambda fut: self._on_goal_response(
-                fut, goal_lat=goal_lat, goal_lon=goal_lon, goal_request_id=goal_request_id
+                fut,
+                goal_lat=goal_lat,
+                goal_lon=goal_lon,
+                goal_request_id=goal_request_id,
+                phase="position",
             )
         )
         self.get_logger().info(
@@ -368,9 +378,13 @@ class Nav2RosController(Node):
             f"lon={format_float_full_precision(goal_lon)} "
             f"-> ENU x={east:.2f} y={north:.2f}"
         )
+        if final_heading_deg is not None:
+            self.get_logger().info(
+                f"목표 지점 도달 후 heading 정렬 예약: {final_heading_deg:.2f} deg"
+            )
 
     def _on_goal_response(
-        self, future, goal_lat: float, goal_lon: float, goal_request_id: int
+        self, future, goal_lat: float, goal_lon: float, goal_request_id: int, phase: str
     ) -> None:  # noqa: ANN001
         try:
             goal_handle = future.result()
@@ -395,11 +409,12 @@ class Nav2RosController(Node):
                 goal_lat=goal_lat,
                 goal_lon=goal_lon,
                 goal_request_id=goal_request_id,
+                phase=phase,
             )
         )
 
     def _on_goal_result(
-        self, future, goal_lat: float, goal_lon: float, goal_request_id: int
+        self, future, goal_lat: float, goal_lon: float, goal_request_id: int, phase: str
     ) -> None:  # noqa: ANN001
         with self._goal_lock:
             self._goal_handle = None
@@ -412,22 +427,66 @@ class Nav2RosController(Node):
             return
 
         if status == 4:
+            if phase == "position" and self._active_goal_heading_deg is not None:
+                self.get_logger().info("위치 도달 완료, 목표 heading 정렬 시작")
+                self._send_heading_alignment_goal(
+                    goal_lat=goal_lat,
+                    goal_lon=goal_lon,
+                    goal_heading_deg=float(self._active_goal_heading_deg),
+                    goal_request_id=goal_request_id,
+                )
+                return
             self.get_logger().info("목표 도달 완료")
             self._publish_move_status(True)
-            payload = self._build_command_status_payload(
-                command_failed=False,
-                reason="목표 지점에 도달했습니다.",
-                start_lat=self.origin_lat,
-                start_lon=self.origin_lon,
+            reached_heading = (
+                float(self._active_goal_heading_deg)
+                if self._active_goal_heading_deg is not None
+                else float("nan")
+            )
+            self.reached_pub.publish(
+                self._make_goal_with_heading_msg(goal_lat, goal_lon, reached_heading)
+            )
+        else:
+            if phase == "heading":
+                self.get_logger().warn(f"heading 정렬 실패, 상태 코드: {status}")
+            else:
+                self.get_logger().warn(f"goal 종료 상태 코드: {status}")
+            self._publish_move_status(False)
+        self._active_goal_heading_deg = None
+        self._active_goal_phase = ""
+
+    def _send_heading_alignment_goal(
+        self, goal_lat: float, goal_lon: float, goal_heading_deg: float, goal_request_id: int
+    ) -> None:
+        east, north = geodetic_to_enu(goal_lat, goal_lon, self.origin_lat, self.origin_lon)
+        yaw = yaw_from_north_cw_deg(goal_heading_deg)
+        qx, qy, qz, qw = quaternion_from_yaw(yaw)
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose = PoseStamped()
+        goal_msg.pose.header.frame_id = self.path_frame
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = east
+        goal_msg.pose.pose.position.y = north
+        goal_msg.pose.pose.position.z = 0.0
+        goal_msg.pose.pose.orientation.x = qx
+        goal_msg.pose.pose.orientation.y = qy
+        goal_msg.pose.pose.orientation.z = qz
+        goal_msg.pose.pose.orientation.w = qw
+        self._active_goal_phase = "heading"
+        send_future = self.nav_client.send_goal_async(goal_msg)
+        send_future.add_done_callback(
+            lambda fut: self._on_goal_response(
+                fut,
                 goal_lat=goal_lat,
                 goal_lon=goal_lon,
+                goal_request_id=goal_request_id,
+                phase="heading",
             )
-            reached_msg = String()
-            reached_msg.data = json.dumps(payload, ensure_ascii=False)
-            self.reached_pub.publish(reached_msg)
-        else:
-            self.get_logger().warn(f"goal 종료 상태 코드: {status}")
-            self._publish_move_status(False)
+        )
+        self.get_logger().info(
+            "Nav2 heading 정렬 goal 전송: "
+            f"heading={goal_heading_deg:.2f} deg at ENU ({east:.2f}, {north:.2f})"
+        )
 
     def _publish_origin_marker(self) -> None:
         yaw = yaw_from_north_cw_deg(self.heading_deg)
@@ -562,52 +621,29 @@ class Nav2RosController(Node):
         msg.data = bool(success)
         self.move_status_pub.publish(msg)
 
-    def _build_command_status_payload(
+    def _make_goal_with_heading_msg(
         self,
-        command_failed: bool,
-        reason: str,
-        start_lat: float | None,
-        start_lon: float | None,
-        goal_lat: float,
-        goal_lon: float,
-    ) -> dict:
-        return {
-            "command_failed": bool(command_failed),
-            "reason": str(reason),
-            "start": {
-                "lat": start_lat,
-                "lon": start_lon,
-            },
-            "goal": {
-                "lat": goal_lat,
-                "lon": goal_lon,
-            },
-            "timestamp_unix": time.time(),
-        }
+        latitude: float,
+        longitude: float,
+        heading_deg_from_north_cw: float,
+    ) -> GoalWithHeading:
+        msg = GoalWithHeading()
+        msg.stamp = self.get_clock().now().to_msg()
+        msg.latitude = float(latitude)
+        msg.longitude = float(longitude)
+        msg.heading_deg_from_north_cw = float(heading_deg_from_north_cw)
+        return msg
 
     def _publish_goal_received_ack(
         self,
         goal_lat: float,
         goal_lon: float,
-        command_failed: bool = False,
-        reason: str = "",
+        goal_heading_deg: float | None,
     ) -> None:
-        start_lat = None
-        start_lon = None
-        if self._mission_anchor_lat is not None and self._mission_anchor_lon is not None:
-            start_lat = float(self._mission_anchor_lat)
-            start_lon = float(self._mission_anchor_lon)
-        payload = self._build_command_status_payload(
-            command_failed=command_failed,
-            reason=reason,
-            start_lat=start_lat,
-            start_lon=start_lon,
-            goal_lat=goal_lat,
-            goal_lon=goal_lon,
+        h = float(goal_heading_deg) if goal_heading_deg is not None else float("nan")
+        self.goal_received_pub.publish(
+            self._make_goal_with_heading_msg(goal_lat, goal_lon, h)
         )
-        msg = String()
-        msg.data = json.dumps(payload, ensure_ascii=False)
-        self.goal_received_pub.publish(msg)
 
     def _publish_current_heading(self, heading_deg: float) -> None:
         msg = Float64()
